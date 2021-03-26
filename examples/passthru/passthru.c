@@ -62,7 +62,7 @@ static DWORD passthru(LPVOID arg);
  */
 int __cdecl main(int argc, char **argv)
 {
-    const char *filter = "true";
+    const char *filter = "outbound && !loopback && ip && tcp.DstPort == 443";
     int threads = 1, batch = 1, priority = 0;
     int i;
     HANDLE handle, thread;
@@ -168,9 +168,105 @@ static DWORD passthru(LPVOID arg)
         exit(EXIT_FAILURE);
     }
 
+    static int count;
+    char buf[64];
+    HANDLE fd;
+    DWORD dwMode;
+
+    sprintf(buf, "\\\\.\\pipe\\levent-%d",0);
+    printf("creating named pipe: %s\n", buf);
+
+    /* Create a duplex pipe which will behave like a socket pair */
+    fd = CreateNamedPipe(buf, PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED, PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+        PIPE_UNLIMITED_INSTANCES, 4096 * sizeof(TCHAR), 4096 * sizeof(TCHAR), 0, NULL);
+    if (fd == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "error: failed to create pipe (%d)\n",
+            GetLastError());
+        exit(EXIT_FAILURE);
+    }
+
+    //w, err : = syscall.CreateFile(syscall.StringToUTF16Ptr("nonblock_test.txt"), syscall.GENERIC_WRITE, syscall.FILE_SHARE_READ, nil, syscall.CREATE_ALWAYS, syscall.FILE_ATTRIBUTE_NORMAL | syscall.FILE_FLAG_OVERLAPPED, 0)
+    // Connect the client end of the pipe
+    /*
+    HANDLE clientFd = CreateFile(
+        buf,   // pipe name 
+        GENERIC_READ |  // read and write access 
+        GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, // no sharing 
+        NULL,           // default security attributes
+        OPEN_EXISTING,  // opens existing pipe 
+        FILE_FLAG_OVERLAPPED,              // default attributes 
+        NULL);
+    if (clientFd == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "error: failed to connect client end of pipe (%d)\n",
+            GetLastError());
+        exit(EXIT_FAILURE);
+    }
+
+    //sv[0] = (int)fd;
+
+    //fd = CreateFile(buf, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    //if (fd == INVALID_HANDLE_VALUE)
+    //    return (-1);
+    //dwMode = PIPE_NOWAIT;
+    //SetNamedPipeHandleState(fd, &dwMode, NULL, NULL);
+    //sv[1] = (int)fd;
+
+    // Open process and get process handle.
+    DWORD processId = 12244;
+    */
+    //HANDLE pHandle = OpenProcess(PROCESS_ALL_ACCESS, TRUE /* inherit handle (TODO: not required for this fd?) */, processId);
+    //if (pHandle == INVALID_HANDLE_VALUE) {
+    //    fprintf(stderr, "error: failed to open process (%d)\n",
+    //        GetLastError());
+    //    exit(EXIT_FAILURE);
+    //}
+
+    // Translate file descriptor.
+    //HANDLE fdDup;
+    //if (!DuplicateHandle(GetCurrentProcess(), clientFd, pHandle, &fdDup, DUPLICATE_SAME_ACCESS, TRUE /* inherit handle */,
+    //    DUPLICATE_SAME_ACCESS /* TODO: not required? */)) {
+    //    fprintf(stderr, "error: failed to duplicate handle (%d)\n",
+    //        GetLastError());
+    //    exit(EXIT_FAILURE);
+    //}
+    //printf("Duplicate handle fd: %d\n", (long long)fdDup);
+
+    DWORD subprocessPID;
+    printf("Enter Psiphon subprocess pid: ");
+    scanf("%lld", &subprocessPID);
+    printf("Subprocess pid %lld\n", subprocessPID);
+
+    printf("Connecting pipe\n");
+    BOOL fConnected = FALSE;
+
+
+    OVERLAPPED cOverlap;
+    HANDLE cEvent = CreateEvent(
+        NULL,    // default security attribute 
+        TRUE,    // manual-reset event 
+        TRUE,    // initial state = signaled 
+        NULL);   // unnamed event object 
+    cOverlap.hEvent = cEvent;
+
+    fConnected = ConnectNamedPipe(fd, &cOverlap) ?
+        TRUE : (GetLastError() == ERROR_PIPE_CONNECTED);
+    if (!fConnected) {
+        printf("WaitForSingleObject\n");
+        DWORD r = WaitForSingleObject(cOverlap.hEvent, INFINITE);
+        if (r != WAIT_OBJECT_0) {
+            fprintf(stderr, "error: client did not connect (%d)\n",
+                GetLastError());
+            exit(EXIT_FAILURE);
+        }
+    }
+    printf("Pipe connected\n");
+
     // Main loop:
     while (TRUE)
     {
+        // TODO/miro: need to do reads and writes concurrently
+
         // Read a matching packet.
         addr_len = batch * sizeof(WINDIVERT_ADDRESS);
         if (!WinDivertRecvEx(handle, packet, packet_len, &recv_len, 0,
@@ -181,6 +277,71 @@ static DWORD passthru(LPVOID arg)
             continue;
         }
 
+        printf("Got packet from pid %lld of length %d\n", addr->Socket.ProcessId, recv_len);
+
+        printf("Writing file\n");
+        DWORD num_written = 0;
+        OVERLAPPED wOverlap;
+        HANDLE hEvent = CreateEvent(
+            NULL,    // default security attribute 
+            TRUE,    // manual-reset event 
+            TRUE,    // initial state = signaled 
+            NULL);   // unnamed event object 
+        wOverlap.hEvent = hEvent;
+
+        if (!WriteFile(fd, packet, recv_len, &num_written, &wOverlap) && GetLastError() != ERROR_IO_PENDING) {
+            // (536) ERR_PIPE_LISTENING 
+            // Waiting for a process to open the other end of the pipe.
+            fprintf(stderr, "error: failed to write pipe (%d)\n",
+                GetLastError());
+            //exit(EXIT_FAILURE);
+        }
+
+        printf("Write: WaitForSingleObject\n");
+        DWORD r = WaitForSingleObject(wOverlap.hEvent, INFINITE);
+        if (r != WAIT_OBJECT_0) {
+            fprintf(stderr, "error: write failed (%d)\n",
+                GetLastError());
+            exit(EXIT_FAILURE);
+        }
+
+        if (wOverlap.InternalHigh != recv_len) {
+            fprintf(stderr, "error: failed to write all packet bytes to pipe (%d/%d bytes written)\n",
+                wOverlap.InternalHigh, recv_len);
+            exit(EXIT_FAILURE);
+        }
+
+        printf("Reading file..\n");
+
+        OVERLAPPED rOverlap;
+        HANDLE rEvent = CreateEvent(
+            NULL,    // default security attribute 
+            TRUE,    // manual-reset event 
+            TRUE,    // initial state = signaled 
+            NULL);   // unnamed event object 
+        rOverlap.hEvent = hEvent;
+        if (!ReadFile(fd, packet, packet_len, &recv_len, &rOverlap) && GetLastError() != ERROR_IO_PENDING) {
+            fprintf(stderr, "error: failed to read bytes from pipe (%d)\n",
+                GetLastError());
+            //exit(EXIT_FAILURE);
+        }
+        printf("Read: WaitForSingleObject\n");
+        r = WaitForSingleObject(rOverlap.hEvent, 100);
+        if (r != WAIT_OBJECT_0 && r != WAIT_TIMEOUT) {
+            fprintf(stderr, "error: read failed (%d) r %d\n",
+                GetLastError(), r);
+            //exit(EXIT_FAILURE);
+        }
+        if (r == WAIT_TIMEOUT) {
+            printf("No new packets, continuing...\n");
+            continue;
+        }
+        printf("Read a packet\n");
+        exit(EXIT_FAILURE);
+        //continue;
+
+        printf("Injecting packet\n");
+
         // Re-inject the matching packet.
         if (!WinDivertSendEx(handle, packet, recv_len, NULL, 0, addr,
                 addr_len, NULL))
@@ -190,4 +351,3 @@ static DWORD passthru(LPVOID arg)
         }
     }
 }
-
